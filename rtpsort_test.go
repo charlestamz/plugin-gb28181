@@ -28,7 +28,7 @@ var items2 = []uint16{
 
 func _pushPsWithCache(p *Publisher, rtp *rtp.Packet) {
 	originRtp := *rtp
-	if config.UdpCacheSize > 0 && !config.TCP {
+	if serverConfig.UdpCacheSize > 0 && !serverConfig.TCP {
 		//序号小于第一个包的丢弃,rtp包序号达到65535后会从0开始，所以这里需要判断一下
 		if rtp.SequenceNumber < p.lastSeq && p.lastSeq-rtp.SequenceNumber < utils.MaxRtpDiff {
 			return
@@ -41,8 +41,8 @@ func _pushPsWithCache(p *Publisher, rtp *rtp.Packet) {
 	if p.lastSeq != 0 {
 		// rtp序号不连续，丢弃PS
 		if p.lastSeq+1 != rtp.SequenceNumber {
-			if config.UdpCacheSize > 0 && !config.TCP {
-				if p.udpCache.Len() < config.UdpCacheSize {
+			if serverConfig.UdpCacheSize > 0 && !serverConfig.TCP {
+				if p.udpCache.Len() < serverConfig.UdpCacheSize {
 					p.udpCache.Push(*rtp)
 					return
 				} else {
@@ -67,7 +67,7 @@ func TestRtpSort(t *testing.T) {
 		},
 		udpCache: utils.NewPqRtp(),
 	}
-	config.UdpCacheSize = 7
+	serverConfig.UdpCacheSize = 7
 
 	patches := gomonkey.ApplyMethod(reflect.TypeOf(&publisher), "PushPS", _pushPsWithCache)
 	defer patches.Reset()
@@ -88,7 +88,7 @@ func TestRtpSortWithEmpty(t *testing.T) {
 		},
 		udpCache: utils.NewPqRtp(),
 	}
-	config.UdpCacheSize = 7
+	serverConfig.UdpCacheSize = 7
 	publisher.udpCache.Push(rtp.Packet{Header: rtp.Header{SequenceNumber: 11665}})
 	patches := gomonkey.ApplyMethod(reflect.TypeOf(&publisher), "PushPS", _pushPsWithCache)
 	defer patches.Reset()

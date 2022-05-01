@@ -2,11 +2,12 @@ package gb28181
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/xml"
+	"fmt"
 
-	"github.com/Monibuca/plugin-gb28181/v3/sip"
-	"github.com/Monibuca/plugin-gb28181/v3/transaction"
 	"github.com/Monibuca/plugin-gb28181/v3/utils"
+	"github.com/ghettovoice/gosip/sip"
 	"github.com/logrusorgru/aurora"
 
 	"net/http"
@@ -16,67 +17,107 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
-func OnRegister(req *sip.Request, tx *transaction.GBTx) {
-	id := req.From.Uri.UserInfo()
+type Authorization struct {
+	*sip.Authorization
+}
+
+func (a *Authorization) Verify(username, passwd, realm, nonce string) bool {
+
+	//1、将 username,realm,password 依次组合获取 1 个字符串，并用算法加密的到密文 r1
+	s1 := fmt.Sprintf("%s:%s:%s", username, realm, passwd)
+	r1 := a.getDigest(s1)
+	//2、将 method，即REGISTER ,uri 依次组合获取 1 个字符串，并对这个字符串使用算法 加密得到密文 r2
+	s2 := fmt.Sprintf("REGISTER:%s", a.Uri())
+	r2 := a.getDigest(s2)
+
+	if r1 == "" || r2 == "" {
+		fmt.Println("Authorization algorithm wrong")
+		return false
+	}
+	//3、将密文 1，nonce 和密文 2 依次组合获取 1 个字符串，并对这个字符串使用算法加密，获得密文 r3，即Response
+	s3 := fmt.Sprintf("%s:%s:%s", r1, nonce, r2)
+	r3 := a.getDigest(s3)
+
+	//4、计算服务端和客户端上报的是否相等
+	return r3 == a.Response()
+}
+
+func (a *Authorization) getDigest(raw string) string {
+	switch a.Algorithm() {
+	case "MD5":
+		return fmt.Sprintf("%x", md5.Sum([]byte(raw)))
+	default: //如果没有算法，默认使用MD5
+		return fmt.Sprintf("%x", md5.Sum([]byte(raw)))
+	}
+}
+
+func OnRegister(req sip.Request, tx sip.ServerTransaction) {
+	from, _ := req.From()
+
+	id := from.Address.User().String()
 
 	passAuth := false
 	// 不需要密码情况
-	if config.Username == "" && config.Password == "" {
+	if serverConfig.Username == "" && serverConfig.Password == "" {
 		passAuth = true
 	} else {
 		// 需要密码情况 设备第一次上报，返回401和加密算法
-		if req.Authorization != nil && req.Authorization.GetUsername() != "" {
+		if hdrs := req.GetHeaders("Authorization"); len(hdrs) > 0 {
+			authenticateHeader := hdrs[0].(*sip.GenericHeader)
+			auth := &Authorization{sip.AuthFromValue(authenticateHeader.Contents)}
+
 			// 有些摄像头没有配置用户名的地方，用户名就是摄像头自己的国标id
 			var username string
-			if req.Authorization.GetUsername() == id {
+			if auth.Username() == id {
 				username = id
 			} else {
-				username = config.Username
+				username = serverConfig.Username
 			}
 
 			if dc, ok := DeviceRegisterCount.LoadOrStore(id, 1); ok && dc.(int) > MaxRegisterCount {
-				var response sip.Response
-				response.Message = req.BuildResponse(http.StatusForbidden)
-				_ = tx.Respond(&response)
+				response := sip.NewResponseFromRequest("", req, http.StatusForbidden, "Forbidden", "")
+				tx.Respond(response)
 				return
 			} else {
 				// 设备第二次上报，校验
 				_nonce, loaded := DeviceNonce.Load(id)
-				if loaded && req.Authorization.Verify(username, config.Password, config.Realm, _nonce.(string)) {
+				if loaded && auth.Verify(username, serverConfig.Password, serverConfig.Realm, _nonce.(string)) {
 					passAuth = true
 				} else {
 					DeviceRegisterCount.Store(id, dc.(int)+1)
 				}
 			}
 		}
-
 	}
 	if passAuth {
-		storeDevice(id, tx.Core, req.Message)
+		storeDevice(id, req, &tx)
 		DeviceNonce.Delete(id)
 		DeviceRegisterCount.Delete(id)
-		m := req.BuildOK()
-		resp := &sip.Response{Message: m}
-		_ = tx.Respond(resp)
-
+		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
 	} else {
-		var response sip.Response
-		response.Message = req.BuildResponseWithPhrase(401, "Unauthorized")
+		response := sip.NewResponseFromRequest("", req, http.StatusUnauthorized, "Unauthorized", "")
 		_nonce, _ := DeviceNonce.LoadOrStore(id, utils.RandNumString(32))
-		response.WwwAuthenticate = sip.NewWwwAuthenticate(config.Realm, _nonce.(string), sip.DIGEST_ALGO_MD5)
-		response.SourceAdd = req.DestAdd
-		response.DestAdd = req.SourceAdd
-		_ = tx.Respond(&response)
+		auth := fmt.Sprintf(
+			`Digest realm="%s",algorithm=%s,nonce="%s"`,
+			serverConfig.Realm,
+			"MD5",
+			_nonce.(string),
+		)
+		response.AppendHeader(&sip.GenericHeader{
+			HeaderName: "WWW-Authenticate",
+			Contents:   auth,
+		})
+		_ = tx.Respond(response)
 	}
 }
-func OnMessage(req *sip.Request, tx *transaction.GBTx) {
-
-	if v, ok := Devices.Load(req.From.Uri.UserInfo()); ok {
+func OnMessage(req sip.Request, tx sip.ServerTransaction) {
+	from, _ := req.From()
+	id := from.Address.User().String()
+	if v, ok := Devices.Load(id); ok {
 		d := v.(*Device)
-		d.SourceAddr = req.SourceAdd
 		if d.Status == string(sip.REGISTER) {
 			d.Status = "ONLINE"
-			go d.QueryDeviceInfo(req)
+			go d.QueryDeviceInfo()
 		}
 		d.UpdateTime = time.Now()
 		temp := &struct {
@@ -90,11 +131,11 @@ func OnMessage(req *sip.Request, tx *transaction.GBTx) {
 			DeviceList   []*Channel `xml:"DeviceList>Item"`
 			RecordList   []*Record  `xml:"RecordList>Item"`
 		}{}
-		decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body)))
+		decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body())))
 		decoder.CharsetReader = charset.NewReaderLabel
 		err := decoder.Decode(temp)
 		if err != nil {
-			err = utils.DecodeGbk(temp, []byte(req.Body))
+			err = utils.DecodeGbk(temp, []byte(req.Body()))
 			if err != nil {
 				Printf("decode catelog err: %s", err)
 			}
@@ -111,7 +152,7 @@ func OnMessage(req *sip.Request, tx *transaction.GBTx) {
 					go d.Catalog()
 				} else {
 					for _, c := range d.Channels {
-						if config.AutoInvite &&
+						if serverConfig.AutoInvite &&
 							(c.LivePublisher == nil || (c.LivePublisher.VideoTracks.Size == 0 && c.LivePublisher.AudioTracks.Size == 0)) {
 							c.Invite("", "")
 						}
@@ -131,28 +172,26 @@ func OnMessage(req *sip.Request, tx *transaction.GBTx) {
 			d.Model = temp.Model
 		case "Alarm":
 			d.Status = "Alarmed"
-			body = sip.BuildAlarmResponseXML(d.ID)
+			body = BuildAlarmResponseXML(d.ID)
 		default:
 			Println("DeviceID:", aurora.Red(d.ID), " Not supported CmdType : "+temp.CmdType+" body:\n", req.Body)
-			response := &sip.Response{req.BuildResponse(http.StatusBadRequest)}
+			response := sip.NewResponseFromRequest("", req, http.StatusBadRequest, "", "")
 			tx.Respond(response)
 			return
 		}
 
-		buildOK := req.BuildOK()
-		buildOK.Body = body
-		response := &sip.Response{buildOK}
-		tx.Respond(response)
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", body))
 	}
 }
-func onBye(req *sip.Request, tx *transaction.GBTx) {
-	response := &sip.Response{req.BuildOK()}
-	_ = tx.Respond(response)
+func onBye(req sip.Request, tx sip.ServerTransaction) {
+	tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
 }
 
 // OnNotify 订阅通知处理
-func OnNotify(req *sip.Request, tx *transaction.GBTx) {
-	if v, ok := Devices.Load(req.From.Uri.UserInfo()); ok {
+func OnNotify(req sip.Request, tx sip.ServerTransaction) {
+	from, _ := req.From()
+	id := from.Address.User().String()
+	if v, ok := Devices.Load(id); ok {
 		d := v.(*Device)
 		d.UpdateTime = time.Now()
 		temp := &struct {
@@ -167,11 +206,11 @@ func OnNotify(req *sip.Request, tx *transaction.GBTx) {
 			// Altitude   string           //位置订阅-海拔高度,单位:m(可选)
 			DeviceList []*notifyMessage `xml:"DeviceList>Item"` //目录订阅
 		}{}
-		decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body)))
+		decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body())))
 		decoder.CharsetReader = charset.NewReaderLabel
 		err := decoder.Decode(temp)
 		if err != nil {
-			err = utils.DecodeGbk(temp, []byte(req.Body))
+			err = utils.DecodeGbk(temp, []byte(req.Body()))
 			if err != nil {
 				Printf("decode catelog err: %s", err)
 			}
@@ -188,15 +227,12 @@ func OnNotify(req *sip.Request, tx *transaction.GBTx) {
 		// 	//报警事件通知 TODO
 		default:
 			Println("DeviceID:", aurora.Red(d.ID), " Not supported CmdType : "+temp.CmdType+" body:\n", req.Body)
-			response := &sip.Response{req.BuildResponse(http.StatusBadRequest)}
+			response := sip.NewResponseFromRequest("", req, http.StatusBadRequest, "", "")
 			tx.Respond(response)
 			return
 		}
 
-		buildOK := req.BuildOK()
-		buildOK.Body = body
-		response := &sip.Response{buildOK}
-		tx.Respond(response)
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", body))
 	}
 }
 

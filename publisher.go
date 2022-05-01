@@ -63,7 +63,7 @@ func (p *Publisher) Publish() (result bool) {
 }
 func (p *Publisher) PushPS(rtp *rtp.Packet) {
 	originRtp := *rtp
-	if config.UdpCacheSize > 0 && config.TCP == false {
+	if serverConfig.UdpCacheSize > 0 && !serverConfig.IsMediaNetworkTCP() {
 		//序号小于第一个包的丢弃,rtp包序号达到65535后会从0开始，所以这里需要判断一下
 		if rtp.SequenceNumber < p.lastSeq && p.lastSeq-rtp.SequenceNumber < utils.MaxRtpDiff {
 			return
@@ -76,8 +76,8 @@ func (p *Publisher) PushPS(rtp *rtp.Packet) {
 	if p.lastSeq != 0 {
 		// rtp序号不连续，丢弃PS
 		if p.lastSeq+1 != rtp.SequenceNumber {
-			if config.UdpCacheSize > 0 && config.TCP == false {
-				if p.udpCache.Len() < config.UdpCacheSize {
+			if serverConfig.UdpCacheSize > 0 && serverConfig.IsMediaNetworkTCP() == false {
+				if p.udpCache.Len() < serverConfig.UdpCacheSize {
 					p.udpCache.Push(*rtp)
 					return
 				} else {

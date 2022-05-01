@@ -1,0 +1,58 @@
+{
+  "ID": "31000000111328010023",
+  "Name": "IP CAMERA",
+  "Manufacturer": "Hikvision",
+  "Model": "DS-2CD2T25-I5",
+  "Owner": "",
+  "RegisterTime": "2022-04-26T09:06:58.532399765+08:00",
+  "UpdateTime": "2022-04-26T23:17:26.047779398+08:00",
+  "LastKeepaliveAt": "2022-04-26T23:17:26.047967055+08:00",
+  "Status": "ONLINE",
+  "Channels": [
+    {
+      "DeviceID": "31000000111328010023",
+      "ParentID": "31000000111328010023",
+      "Name": "è¡Œæ”¿æ¥¼åŽé—¨è½¦æ£š",
+      "Manufacturer": "Hikvision",
+      "Model": "IP Camera",
+      "Owner": "Owner",
+      "CivilCode": "CivilCode",
+      "Address": "Address",
+      "Parental": 0,
+      "SafetyWay": 0,
+      "RegisterWay": 1,
+      "Secrecy": 0,
+      "Status": "ON",
+      "RecordPublisher": null,
+      "LivePublisher": {
+        "URL": "",
+        "StreamPath": "31000000111328010023/31000000111328010023",
+        "Type": "GB28181 Live",
+        "StartTime": "2022-04-26T23:17:24.749733997+08:00",
+        "Subscribers": null,
+        "VideoTracks": {},
+        "AudioTracks": {},
+        "DataTracks": {},
+        "AutoCloseAfter": -1,
+        "Transcoding": null,
+        "ExtraProp": null,
+        "AppName": "31000000111328010023",
+        "StreamName": "31000000111328010023"
+      },
+      "LiveSubSP": "",
+      "Records": null,
+      "RecordStartTime": "",
+      "RecordEndTime": "",
+      "GpsTime": "0001-01-01T00:00:00Z",
+      "Longitude": "",
+      "Latitude": ""
+    }
+  ],
+  "Addr": "10.100.10.23:35517",
+  "SipIP": "192.168.21.39",
+  "SipPort": 5060,
+  "SipNetwork": "TCP"
+}, {"ID": "31000000112000012064", "Name": "4#113f", "Manufacturer": "KEDACOM", "Model": "IPC2233-FN-SIR40-Z2712", "Owner": "", "RegisterTime": "2022-04-26T09:07:03.291988513+08:00", "UpdateTime": "2022-04-26T23:18:10.18062226+08:00", "LastKeepaliveAt": "2022-04-26T23:18:10.180723845+08:00", "Status": "ONLINE", "Channels":[
+{"DeviceID": "31000000112000012064", "ParentID": "31000000112000012064", "Name": "4#111f", "Manufacturer": "KEDACOM", "Model": "IPC2233-FN-SIR40-Z2712", "Owner": "owner", "CivilCode": "", "Address": "", "Parental": 0, "SafetyWay": 0, "RegisterWay": 1, "Secrecy": 0, "Status": "ON", "RecordPublisher": null, "LivePublisher": {"URL": "", "StreamPath": "31000000112000012064/31000000112000012064", "Type":"GB28181 Live", "StartTime": "2022-04-26T09:07:03.334980692+08:00", "Subscribers":[{"ID": "[::1]:48580", "TotalDrop": 0, "TotalPacket": 0, "Type": "Jessica", "BufferLength": 0, "Delay": 0, "SubscribeTime": "2022-04-26T23:17:56.651034569+08:00", "SubscribeArgs": {}}], "VideoTracks": {"h264": {"CodecID": 7, "PacketCount": 1276863, "BPS": 23492, "SPSInfo": {"ProfileIdc": 77, "LevelIdc": 31,"MbWidth": 80, "MbHeight": 45, "CropLeft":0, "CropRight": 0, "CropTop": 0,"CropBottom": 0, "Width": 1280, "Height":720}, "GOP": 50, "UsingDonlField": false}}, "AudioTracks": {}, "DataTracks":{}, "AutoCloseAfter": -1, "Transcoding": null, "ExtraProp": null, "AppName": "31000000112000012064", "StreamName": "31000000112000012064"}, "LiveSubSP": "", "Records":null, "RecordStartTime": "", "RecordEndTime": "","GpsTime": "0001-01-01T00:00:00Z", "Longitude": "", "Latitude":""}
+], "Addr": "192.168.12.64:5060", "SipIP": "192.168.21.39", "SipPort": 5060, "SipNetwork": "UDP"
+}

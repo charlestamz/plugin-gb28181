@@ -1,60 +1,90 @@
 package gb28181
 
 import (
-	"bufio"
-	"io"
+	"github.com/sirupsen/logrus"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
-	"sync"
+	"strings"
+	_ "sync"
 	"time"
 
 	"github.com/Monibuca/engine/v3"
-	"github.com/Monibuca/plugin-gb28181/v3/sip"
-	"github.com/Monibuca/plugin-gb28181/v3/transaction"
 	. "github.com/Monibuca/utils/v3"
-	. "github.com/logrusorgru/aurora"
-	"github.com/pion/rtp"
+	"github.com/ghettovoice/gosip/sip"
 )
 
-var (
-	Ignores      = make(map[string]struct{})
-	publishers   Publishers
-	serverConfig *transaction.Config
-)
+type GB28181Config struct {
+	AutoInvite     bool
+	AutoCloseAfter int
+	PreFetchRecord bool
 
-const MaxRegisterCount = 3
+	//sip服务器的配置
+	SipNetwork string //传输协议，默认UDP，可选TCP
+	SipIP      string //sip 服务器公网IP
+	SipPort    uint16 //sip 服务器端口，默认 5060
+	Serial     string //sip 服务器 id, 默认 34020000002000000001
+	Realm      string //sip 服务器域，默认 3402000000
+	Username   string //sip 服务器账号
+	Password   string //sip 服务器密码
 
-func FindChannel(deviceId string, channelId string) (c *Channel) {
-	if v, ok := Devices.Load(deviceId); ok {
-		d := v.(*Device)
-		d.channelMutex.RLock()
-		c = d.channelMap[channelId]
-		d.channelMutex.RUnlock()
-	}
-	return
+	AckTimeout        uint16 //sip 服务应答超时，单位秒
+	RegisterValidity  int    //注册有效期，单位秒，默认 3600
+	RegisterInterval  int    //注册间隔，单位秒，默认 60
+	HeartbeatInterval int    //心跳间隔，单位秒，默认 60
+	HeartbeatRetry    int    //心跳超时次数，默认 3
+
+	//媒体服务器配置
+	MediaIP          string //媒体服务器地址
+	MediaPort        uint16 //媒体服务器端口
+	MediaNetwork     string //媒体传输协议，默认UDP，可选TCP
+	MediaPortMin     uint16
+	MediaPortMax     uint16
+	MediaIdleTimeout uint16 //推流超时时间，超过则断开链接，让设备重连
+
+	AudioEnable       bool //是否开启音频
+	LogVerbose        bool
+	WaitKeyFrame      bool //是否等待关键帧，如果等待，则在收到第一个关键帧之前，忽略所有媒体流
+	RemoveBanInterval int  //移除禁止设备间隔
+	UdpCacheSize      int  //udp缓存大小
+
+	Server
 }
 
-type Publishers struct {
-	data map[uint32]*Publisher
-	sync.RWMutex
+func (s *GB28181Config) IsMediaNetworkTCP() bool {
+	return strings.ToLower(s.MediaNetwork) == "tcp"
 }
 
-func (p *Publishers) Add(key uint32, pp *Publisher) {
-	p.Lock()
-	p.data[key] = pp
-	p.Unlock()
-}
-func (p *Publishers) Remove(key uint32) {
-	p.Lock()
-	delete(p.data, key)
-	p.Unlock()
-}
-func (p *Publishers) Get(key uint32) *Publisher {
-	p.RLock()
-	defer p.RUnlock()
-	return p.data[key]
+var serverConfig = &GB28181Config{
+
+	AutoInvite:     true,
+	AutoCloseAfter: -1,
+	PreFetchRecord: false,
+	UdpCacheSize:   0,
+	SipNetwork:     "udp",
+	SipIP:          "127.0.0.1",
+	SipPort:        5060,
+	Serial:         "34020000002000000001",
+	Realm:          "3402000000",
+	Username:       "",
+	Password:       "",
+
+	AckTimeout:        10,
+	RegisterValidity:  60,
+	RegisterInterval:  60,
+	HeartbeatInterval: 60,
+	HeartbeatRetry:    3,
+
+	MediaIP:          "127.0.0.1",
+	MediaPort:        58200,
+	MediaIdleTimeout: 30,
+	MediaNetwork:     "udp",
+
+	RemoveBanInterval: 600,
+	LogVerbose:        false,
+	AudioEnable:       true,
+	WaitKeyFrame:      true,
 }
 
 var config = struct {
@@ -62,6 +92,9 @@ var config = struct {
 	Realm             string
 	ListenAddr        string
 	Expires           int
+	SipIP             string
+	SipPort           uint16
+	MediaIP           string
 	MediaPort         uint16
 	AutoInvite        bool
 	AutoCloseAfter    int
@@ -74,7 +107,7 @@ var config = struct {
 	Password          string
 	UdpCacheSize      int //udp排序缓存
 	LogVerbose        bool
-}{"34020000002000000001", "3402000000", "127.0.0.1:5060", 3600, 58200, false, -1, nil, false, 1, 600, false, "", "", 0, false}
+}{"34020000002000000001", "3402000000", "0.0.0.0:5060", 3600, "0.0.0.0", 5060, "0.0.0.0", 58200, false, -1, nil, false, 1, 600, false, "", "", 0, false}
 
 func init() {
 	pc := engine.PluginConfig{
@@ -82,44 +115,51 @@ func init() {
 		Config: &config,
 	}
 	pc.Install(run)
-	publishers.data = make(map[uint32]*Publisher)
 }
 
-func storeDevice(id string, s *transaction.Core, req *sip.Message) {
+func storeDevice(id string, req sip.Request, tx *sip.ServerTransaction) {
 	var d *Device
+	from, _ := req.From()
 
+	deviceAddr := sip.Address{
+		DisplayName: from.DisplayName,
+		Uri:         from.Address,
+	}
 	if _d, loaded := Devices.Load(id); loaded {
 		d = _d.(*Device)
 		d.UpdateTime = time.Now()
-		d.from = &sip.Contact{Uri: req.StartLine.Uri, Params: make(map[string]string)}
-		d.to = req.To
-		d.Addr = req.Via.GetSendBy()
-
-		//TODO: Should we send  GetDeviceInf request?
-		//message := d.CreateMessage(sip.MESSAGE)
-		//message.Body = sip.GetDeviceInfoXML(d.ID)
-
-		//request := &sip.Request{Message: message}
-		//if newTx, err := s.Request(request); err == nil {
-		//	if _, err = newTx.SipResponse(); err != nil {
-		//		Println("notify device after register,", err)
-		//		return
-		//	}
-		//}
-
+		d.Addr = req.Source()
+		d.addr = deviceAddr
 	} else {
-		Devices.Store(id, &Device{
+		//猜测终端看到的服务器ip地址
+		ipAddr, err := net.ResolveUDPAddr("", req.Destination())
+		guessIp := ipAddr.IP.String()
+		guessPort := uint16(ipAddr.Port)
+		if err == nil {
+			if guessIp == "127.0.0.1" || guessIp == "::" {
+				guessIp = serverConfig.SipIP
+				guessPort = serverConfig.SipPort
+			}
+		}
+		d = &Device{
 			ID:           id,
 			RegisterTime: time.Now(),
 			UpdateTime:   time.Now(),
 			Status:       string(sip.REGISTER),
-			Core:         s,
-			from:         &sip.Contact{Uri: req.StartLine.Uri, Params: make(map[string]string)},
-			to:           req.To,
-			Addr:         req.Via.GetSendBy(),
-			SipIP:        serverConfig.MediaIP,
+			addr:         deviceAddr,
+			tx:           tx,
+			Addr:         req.Source(),
 			channelMap:   make(map[string]*Channel),
-		})
+			config:       serverConfig,
+			Transport:    strings.ToUpper(req.Transport()),
+			SipIP:        guessIp,
+			SipPort:      guessPort,
+			MediaIP:      serverConfig.MediaIP,
+			MediaPort:    serverConfig.MediaPort,
+		}
+		Devices.Store(id, d)
+		logrus.Debug("StoreDevice ", d)
+		go d.Catalog()
 	}
 }
 
@@ -128,58 +168,45 @@ func run() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	Print(Green("server gb28181 start at"), BrightBlue(config.ListenAddr))
 	for _, id := range config.Ignore {
-		Ignores[id] = struct{}{}
+		serverConfig.Ignores[id] = struct{}{}
 	}
-	useTCP := config.TCP
-	serverConfig = &transaction.Config{
-		SipIP:             ipAddr.IP.String(),
-		SipPort:           uint16(ipAddr.Port),
-		SipNetwork:        "UDP",
-		Serial:            config.Serial,
-		Realm:             config.Realm,
-		Username:          config.Username,
-		Password:          config.Password,
-		AckTimeout:        10,
-		MediaIP:           ipAddr.IP.String(),
-		RegisterValidity:  config.Expires,
-		RegisterInterval:  60,
-		HeartbeatInterval: 60,
-		HeartbeatRetry:    3,
-		AudioEnable:       true,
-		WaitKeyFrame:      true,
-		MediaIdleTimeout:  30,
-		RemoveBanInterval: config.RemoveBanInterval,
-		UdpCacheSize:      config.UdpCacheSize,
-		LogVerbose:        config.LogVerbose,
-	}
-
-	s := transaction.NewCore(serverConfig)
-	s.RegistHandler(sip.REGISTER, OnRegister)
-	s.RegistHandler(sip.MESSAGE, OnMessage)
-	s.RegistHandler(sip.NOTIFY, OnNotify)
-	s.RegistHandler(sip.BYE, onBye)
-
-	//OnStreamClosedHooks.AddHook(func(stream *Stream) {
-	//	Devices.Range(func(key, value interface{}) bool {
-	//		device:=value.(*Device)
-	//		for _,channel := range device.Channels {
-	//			if stream.StreamPath == channel.RecordSP {
-	//
-	//			}
-	//		}
-	//	})
-	//})
-	if useTCP {
-		listenMediaTCP()
+	if config.TCP {
+		serverConfig.SipNetwork = "tcp"
+		serverConfig.MediaNetwork = "tcp"
 	} else {
-		go listenMediaUDP()
+		serverConfig.SipNetwork = "udp"
+		serverConfig.MediaNetwork = "udp"
 	}
-	// go queryCatalog(serverConfig)
-	if serverConfig.Username != "" || serverConfig.Password != "" {
-		go removeBanDevice(serverConfig)
+	if config.SipIP == "127.0.0.1" || config.SipIP == "0.0.0.0" {
+		serverConfig.SipIP = ipAddr.IP.String()
+	} else {
+		serverConfig.SipIP = config.SipIP
 	}
+	serverConfig.SipPort = config.SipPort
+	serverConfig.Serial = config.Serial
+	serverConfig.Realm = config.Realm
+	serverConfig.Username = config.Username
+	serverConfig.Password = config.Password
+	serverConfig.AckTimeout = 10
+	serverConfig.MediaIP = config.MediaIP
+	serverConfig.MediaPort = config.MediaPort
+	if config.MediaIP == "0.0.0.0" {
+		serverConfig.MediaIP = config.SipIP
+	}
+
+	serverConfig.RegisterValidity = config.Expires
+	serverConfig.RegisterInterval = 60
+	serverConfig.HeartbeatInterval = 60
+	serverConfig.HeartbeatRetry = 3
+	serverConfig.AudioEnable = true
+	serverConfig.WaitKeyFrame = true
+	serverConfig.MediaIdleTimeout = 30
+	serverConfig.RemoveBanInterval = config.RemoveBanInterval
+	serverConfig.UdpCacheSize = config.UdpCacheSize
+	serverConfig.LogVerbose = config.LogVerbose
+	serverConfig.MediaPortMin = config.MediaPort
+	serverConfig.MediaPortMax = config.MediaPort + config.TCPMediaPortNum - 1
 
 	http.HandleFunc("/api/gb28181/query/records", func(w http.ResponseWriter, r *http.Request) {
 		CORS(w, r)
@@ -275,80 +302,5 @@ func run() {
 		}
 	})
 
-	s.StartAndWait()
-}
-func listenMediaTCP() {
-	for i := uint16(0); i < config.TCPMediaPortNum; i++ {
-		addr := ":" + strconv.Itoa(int(config.MediaPort+i))
-		go ListenTCP(addr, func(conn net.Conn) {
-			var rtpPacket rtp.Packet
-			reader := bufio.NewReader(conn)
-			lenBuf := make([]byte, 2)
-			defer conn.Close()
-			var err error
-			for err == nil {
-				if _, err = io.ReadFull(reader, lenBuf); err != nil {
-					return
-				}
-				ps := make([]byte, BigEndian.Uint16(lenBuf))
-				if _, err = io.ReadFull(reader, ps); err != nil {
-					return
-				}
-				if err := rtpPacket.Unmarshal(ps); err != nil {
-					Println("gb28181 decode rtp error:", err)
-				} else if publisher := publishers.Get(rtpPacket.SSRC); publisher != nil && publisher.Err() == nil {
-					publisher.PushPS(&rtpPacket)
-				}
-			}
-		})
-	}
-}
-func listenMediaUDP() {
-	var rtpPacket rtp.Packet
-	networkBuffer := 1048576
-	addr := ":" + strconv.Itoa(int(config.MediaPort))
-	conn, err := ListenUDP(addr, networkBuffer)
-	if err != nil {
-		Printf("listen udp %s err: %v", addr, err)
-		return
-	}
-	bufUDP := make([]byte, networkBuffer)
-	Printf("udp server start listen video port[%d]", config.MediaPort)
-	defer Printf("udp server stop listen video port[%d]", config.MediaPort)
-	for n, _, err := conn.ReadFromUDP(bufUDP); err == nil; n, _, err = conn.ReadFromUDP(bufUDP) {
-		ps := bufUDP[:n]
-		if err := rtpPacket.Unmarshal(ps); err != nil {
-			Println("gb28181 decode rtp error:", err)
-		}
-		if publisher := publishers.Get(rtpPacket.SSRC); publisher != nil && publisher.Err() == nil {
-			publisher.PushPS(&rtpPacket)
-		}
-	}
-}
-
-// func queryCatalog(config *transaction.Config) {
-// 	t := time.NewTicker(time.Duration(config.CatalogInterval) * time.Second)
-// 	for range t.C {
-// 		Devices.Range(func(key, value interface{}) bool {
-// 			device := value.(*Device)
-// 			if time.Since(device.UpdateTime) > time.Duration(config.RegisterValidity)*time.Second {
-// 				Devices.Delete(key)
-// 			} else if device.Channels != nil {
-// 				go device.Catalog()
-// 			}
-// 			return true
-// 		})
-// 	}
-// }
-
-func removeBanDevice(config *transaction.Config) {
-	t := time.NewTicker(time.Duration(config.RemoveBanInterval) * time.Second)
-	for range t.C {
-		DeviceRegisterCount.Range(func(key, value interface{}) bool {
-			if value.(int) > MaxRegisterCount {
-				DeviceRegisterCount.Delete(key)
-			}
-			return true
-		})
-	}
+	serverConfig.startServer()
 }

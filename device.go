@@ -1,20 +1,19 @@
 package gb28181
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Monibuca/engine/v3"
-	"github.com/Monibuca/plugin-gb28181/v3/sip"
-	"github.com/Monibuca/plugin-gb28181/v3/transaction"
 	"github.com/Monibuca/plugin-gb28181/v3/utils"
 	. "github.com/Monibuca/utils/v3"
 	// . "github.com/logrusorgru/aurora"
+	"github.com/ghettovoice/gosip/sip"
 )
 
 const TIME_LAYOUT = "2006-01-02T15:04:05"
@@ -43,26 +42,31 @@ var (
 )
 
 type Device struct {
-	*transaction.Core `json:"-"`
-	ID                string
-	Name              string
-	Manufacturer      string
-	Model             string
-	Owner             string
-	RegisterTime      time.Time
-	UpdateTime        time.Time
-	LastKeepaliveAt   time.Time
-	Status            string
-	Channels          []*Channel
-	sn                int
-	from              *sip.Contact
-	to                *sip.Contact
-	Addr              string
-	SipIP             string //暴露的IP
-	SourceAddr        net.Addr
-	channelMap        map[string]*Channel
-	channelMutex      sync.RWMutex
-	subscriber        struct {
+	//*transaction.Core `json:"-"`
+	config          *GB28181Config
+	ID              string
+	Name            string
+	Manufacturer    string
+	Model           string
+	Owner           string
+	RegisterTime    time.Time
+	UpdateTime      time.Time
+	LastKeepaliveAt time.Time
+	Status          string
+	Channels        []*Channel
+	sn              int
+	addr            sip.Address
+	tx              *sip.ServerTransaction
+	Addr            string //Compat for UI
+	SipIP           string //对设备暴露的IP
+	SipPort         uint16
+	MediaIP         string //对设备暴露的IP
+	MediaPort       uint16
+
+	Transport    string //每个设备都有自己的传输方式
+	channelMap   map[string]*Channel
+	channelMutex sync.RWMutex
+	subscriber   struct {
 		CallID  string
 		Timeout time.Time
 	}
@@ -92,7 +96,7 @@ func (d *Device) UpdateChannels(list []*Channel) {
 	d.channelMutex.Lock()
 	defer d.channelMutex.Unlock()
 	for _, c := range list {
-		if _, ok := Ignores[c.DeviceID]; ok {
+		if _, ok := d.config.Ignores[c.DeviceID]; ok {
 			continue
 		}
 		if c.ParentID != "" {
@@ -110,7 +114,7 @@ func (d *Device) UpdateChannels(list []*Channel) {
 		}
 		if old, ok := d.channelMap[c.DeviceID]; ok {
 			c.ChannelEx = old.ChannelEx
-			if config.PreFetchRecord {
+			if d.config.PreFetchRecord {
 				n := time.Now()
 				n = time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.Local)
 				if len(c.Records) == 0 || (n.Format(TIME_LAYOUT) == c.RecordStartTime &&
@@ -118,7 +122,7 @@ func (d *Device) UpdateChannels(list []*Channel) {
 					go c.QueryRecord(n.Format(TIME_LAYOUT), n.Add(time.Hour*24-time.Second).Format(TIME_LAYOUT))
 				}
 			}
-			if config.AutoInvite &&
+			if serverConfig.AutoInvite &&
 				(c.LivePublisher == nil || (c.LivePublisher.VideoTracks.Size == 0 && c.LivePublisher.AudioTracks.Size == 0)) {
 				c.Invite("", "")
 			}
@@ -127,7 +131,7 @@ func (d *Device) UpdateChannels(list []*Channel) {
 			c.ChannelEx = &ChannelEx{
 				device: d,
 			}
-			if config.AutoInvite {
+			if d.config.AutoInvite {
 				c.Invite("", "")
 			}
 		}
@@ -147,118 +151,139 @@ func (d *Device) UpdateRecord(channelId string, list []*Record) {
 	d.channelMutex.RUnlock()
 }
 
-func (d *Device) CreateMessage(Method sip.Method) (requestMsg *sip.Message) {
+func (d *Device) CreateRequest(Method sip.RequestMethod) (req sip.Request) {
 	d.sn++
-	requestMsg = &sip.Message{
-		Mode:        sip.SIP_MESSAGE_REQUEST,
-		MaxForwards: 70,
-		UserAgent:   "Monibuca",
-		StartLine: &sip.StartLine{
-			Method: Method,
-			Uri:    d.to.Uri,
-		}, Via: &sip.Via{
-			Transport: "UDP",
-			Host:      d.Core.SipIP,
-			Port:      fmt.Sprintf("%d", d.SipPort),
-			Params: map[string]string{
-				"branch": fmt.Sprintf("z9hG4bK%s", utils.RandNumString(8)),
-				"rport":  "-1", //only key,no-value
-			},
-		}, From: &sip.Contact{Uri: d.from.Uri, Params: map[string]string{"tag": utils.RandNumString(9)}},
-		To: d.to, CSeq: &sip.CSeq{
-			ID:     uint32(d.sn),
-			Method: Method,
-		}, CallID: utils.RandNumString(10),
-		Addr: d.Addr,
-	}
-	var err2 error
-	requestMsg.DestAdd, err2 = d.ResolveAddress(requestMsg)
-	if err2 != nil {
-		return nil
-	}
-	//intranet ip , let's resolve it with public ip
-	var deviceIp, deviceSourceIP net.IP
-	switch addr := requestMsg.DestAdd.(type) {
-	case *net.UDPAddr:
-		deviceIp = addr.IP
-	case *net.TCPAddr:
-		deviceIp = addr.IP
-	}
 
-	switch addr2 := d.SourceAddr.(type) {
-	case *net.UDPAddr:
-		deviceSourceIP = addr2.IP
-	case *net.TCPAddr:
-		deviceSourceIP = addr2.IP
+	callId := sip.CallID(utils.RandNumString(10))
+	userAgent := sip.UserAgentHeader("Monibuca")
+	cseq := sip.CSeq{
+		SeqNo:      uint32(d.sn),
+		MethodName: Method,
 	}
-	if deviceIp.IsPrivate() && !deviceSourceIP.IsPrivate() {
-		requestMsg.DestAdd = d.SourceAddr
+	port := sip.Port(d.SipPort)
+	serverAddr := sip.Address{
+		//DisplayName: sip.String{Str: d.serverConfig.Serial},
+		Uri: &sip.SipUri{
+			FUser: sip.String{Str: d.config.Serial},
+			FHost: d.SipIP,
+			FPort: &port,
+		},
+		Params: sip.NewParams().Add("tag", sip.String{Str: utils.RandNumString(9)}),
 	}
+	req = sip.NewRequest(
+		"",
+		Method,
+		d.addr.Uri,
+		"SIP/2.0",
+		[]sip.Header{
+			serverAddr.AsFromHeader(),
+			d.addr.AsToHeader(),
+			&callId,
+			&userAgent,
+			&cseq,
+			serverAddr.AsContactHeader(),
+		},
+		"",
+		nil,
+	)
+
+	req.SetTransport(d.Transport)
+	req.SetDestination(d.Addr)
+	//fmt.Printf("构建请求参数:%s", *&req)
+	// requestMsg.DestAdd, err2 = d.ResolveAddress(requestMsg)
+	// if err2 != nil {
+	// 	return nil
+	// }
+	//intranet ip , let's resolve it with public ip
+	// var deviceIp, deviceSourceIP net.IP
+	// switch addr := requestMsg.DestAdd.(type) {
+	// case *net.UDPAddr:
+	// 	deviceIp = addr.IP
+	// case *net.TCPAddr:
+	// 	deviceIp = addr.IP
+	// }
+
+	// switch addr2 := d.SourceAddr.(type) {
+	// case *net.UDPAddr:
+	// 	deviceSourceIP = addr2.IP
+	// case *net.TCPAddr:
+	// 	deviceSourceIP = addr2.IP
+	// }
+	// if deviceIp.IsPrivate() && !deviceSourceIP.IsPrivate() {
+	// 	requestMsg.DestAdd = d.SourceAddr
+	// }
 	return
 }
-func (d *Device) Subscribe() int {
-	requestMsg := d.CreateMessage(sip.SUBSCRIBE)
-	if d.subscriber.CallID != "" {
-		requestMsg.CallID = d.subscriber.CallID
-	}
-	requestMsg.Expires = 3600
-	requestMsg.Event = "Catalog"
-	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(requestMsg.Expires))
-	requestMsg.ContentType = "Application/MANSCDP+xml"
-	requestMsg.Contact = &sip.Contact{
-		Uri: sip.NewURI(fmt.Sprintf("%s@%s:%d", d.Serial, d.SipIP, d.SipPort)),
-	}
-	requestMsg.Body = sip.BuildCatalogXML(d.sn, requestMsg.To.Uri.UserInfo())
-	requestMsg.ContentLength = len(requestMsg.Body)
 
-	request := &sip.Request{Message: requestMsg}
-	response, err := d.Core.SipRequestForResponse(request)
+func (d *Device) Subscribe() int {
+	request := d.CreateRequest(sip.SUBSCRIBE)
+	if d.subscriber.CallID != "" {
+		callId := sip.CallID(utils.RandNumString(10))
+		request.AppendHeader(&callId)
+	}
+	expires := sip.Expires(3600)
+	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(expires))
+	contentType := sip.ContentType("Application/MANSCDP+xml")
+	request.AppendHeader(&contentType)
+	request.AppendHeader(&expires)
+
+	request.SetBody(BuildCatalogXML(d.sn, d.ID), true)
+
+	response, err := d.SipRequestForResponse(request)
 	if err == nil && response != nil {
-		if response.GetStatusCode() == 200 {
-			d.subscriber.CallID = requestMsg.CallID
+		if response.StatusCode() == 200 {
+			callId, _ := request.CallID()
+			d.subscriber.CallID = string(*callId)
 		} else {
 			d.subscriber.CallID = ""
 		}
-		return response.GetStatusCode()
+		return int(response.StatusCode())
 	}
 	return http.StatusRequestTimeout
 }
 
 func (d *Device) Catalog() int {
-	requestMsg := d.CreateMessage(sip.MESSAGE)
-	requestMsg.Expires = 3600
-	requestMsg.Event = "Catalog"
-	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(requestMsg.Expires))
-	requestMsg.ContentType = "Application/MANSCDP+xml"
-	requestMsg.Body = sip.BuildCatalogXML(d.sn, requestMsg.To.Uri.UserInfo())
-	requestMsg.ContentLength = len(requestMsg.Body)
+	request := d.CreateRequest(sip.MESSAGE)
+	expires := sip.Expires(3600)
+	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(expires))
+	contentType := sip.ContentType("Application/MANSCDP+xml")
 
-	request := &sip.Request{Message: requestMsg}
-	response, err := d.Core.SipRequestForResponse(request)
-	if err == nil && response != nil {
-		return response.GetStatusCode()
+	request.AppendHeader(&contentType)
+	request.AppendHeader(&expires)
+	request.SetBody(BuildCatalogXML(d.sn, d.ID), true)
+	// 输出Sip请求设备通道信息信令
+	resp, err := d.SipRequestForResponse(request)
+	if err == nil && resp != nil {
+		return int(resp.StatusCode())
 	}
 	return http.StatusRequestTimeout
 }
-func (d *Device) QueryDeviceInfo(req *sip.Request) {
+
+func (d *Device) QueryDeviceInfo() {
 	for i := time.Duration(5); i < 100; i++ {
 
-		Printf("device.QueryDeviceInfo:%s ipaddr:%s", d.ID, d.Addr)
+		Printf(fmt.Sprintf("QueryDeviceInfo:%s ipaddr:%s", d.ID, d.Addr))
 		time.Sleep(time.Second * i)
-		requestMsg := d.CreateMessage(sip.MESSAGE)
-		requestMsg.ContentType = "Application/MANSCDP+xml"
-		requestMsg.Body = sip.BuildDeviceInfoXML(d.sn, requestMsg.To.Uri.UserInfo())
-		requestMsg.ContentLength = len(requestMsg.Body)
-		request := &sip.Request{Message: requestMsg}
+		request := d.CreateRequest(sip.MESSAGE)
+		contentType := sip.ContentType("Application/MANSCDP+xml")
+		request.AppendHeader(&contentType)
+		request.SetBody(BuildDeviceInfoXML(d.sn, d.ID), true)
 
-		response, _ := d.Core.SipRequestForResponse(request)
+		response, err := d.SipRequestForResponse(request)
+		if err != nil {
+			Printf("QueryDeviceInfo device %s send Catalog response Error: %s\n", d.ID, err)
+		}
 		if response != nil {
-
-			if response.Via != nil && response.Via.Params["received"] != "" {
-				d.SipIP = response.Via.Params["received"]
+			via, _ := response.ViaHop()
+			if via != nil {
+				d.SipIP = via.Host
 			}
-			if response.GetStatusCode() != 200 {
-				Printf("device %s send Catalog : %d\n", d.ID, response.GetStatusCode())
+			if d.MediaIP == "127.0.0.1" || d.MediaIP == "::" || d.MediaIP == "0.0.0.0" {
+				d.MediaIP = d.SipIP
+				d.MediaPort = serverConfig.MediaPort
+			}
+			if response.StatusCode() != 200 {
+				Printf("device %s send Catalog : %d\n", d.ID, response.StatusCode())
 			} else {
 				d.Subscribe()
 				break
@@ -267,30 +292,34 @@ func (d *Device) QueryDeviceInfo(req *sip.Request) {
 	}
 }
 
+func (d *Device) SipRequestForResponse(request sip.Request) (sip.Response, error) {
+	return (*GetSipServer(d.Transport)).RequestWithContext(context.Background(), request)
+}
+
 // MobilePositionSubscribe 移动位置订阅
 func (d *Device) MobilePositionSubscribe(id string, expires int, interval int) (code int) {
-	mobilePosition := d.CreateMessage(sip.SUBSCRIBE)
+	mobilePosition := d.CreateRequest(sip.SUBSCRIBE)
 	if d.subscriber.CallID != "" {
-		mobilePosition.CallID = d.subscriber.CallID
+		callId := sip.CallID(utils.RandNumString(10))
+		mobilePosition.ReplaceHeaders(callId.Name(), []sip.Header{&callId})
 	}
-	mobilePosition.Expires = expires
-	mobilePosition.Event = "presence"
-	mobilePosition.Contact = &sip.Contact{
-		Uri: sip.NewURI(fmt.Sprintf("%s@%s:%d", d.Serial, d.SipIP, d.SipPort)),
-	}
-	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(mobilePosition.Expires))
-	mobilePosition.ContentType = "Application/MANSCDP+xml"
-	mobilePosition.Body = sip.BuildDevicePositionXML(d.sn, id, interval)
-	mobilePosition.ContentLength = len(mobilePosition.Body)
-	msg := &sip.Request{Message: mobilePosition}
-	response, err := d.Core.SipRequestForResponse(msg)
+	expiresHeader := sip.Expires(expires)
+	d.subscriber.Timeout = time.Now().Add(time.Second * time.Duration(expires))
+	contentType := sip.ContentType("Application/MANSCDP+xml")
+	mobilePosition.AppendHeader(&contentType)
+	mobilePosition.AppendHeader(&expiresHeader)
+
+	mobilePosition.SetBody(BuildDevicePositionXML(d.sn, id, interval), true)
+
+	response, err := d.SipRequestForResponse(mobilePosition)
 	if err == nil && response != nil {
-		if response.GetStatusCode() == 200 {
-			d.subscriber.CallID = mobilePosition.CallID
+		if response.StatusCode() == 200 {
+			callId, _ := mobilePosition.CallID()
+			d.subscriber.CallID = callId.String()
 		} else {
 			d.subscriber.CallID = ""
 		}
-		return response.GetStatusCode()
+		return int(response.StatusCode())
 	}
 	return http.StatusRequestTimeout
 }

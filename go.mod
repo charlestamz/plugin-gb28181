@@ -6,9 +6,11 @@ require (
 	github.com/Monibuca/engine/v3 v3.5.0
 	github.com/Monibuca/utils/v3 v3.0.5
 	github.com/agiledragon/gomonkey/v2 v2.2.0
+	github.com/ghettovoice/gosip v0.0.0-20220203123749-bc456081bd7a
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/pion/rtp v1.7.4
 	golang.org/x/net v0.0.0-20211112202133-69e39bad7dc2
 	golang.org/x/text v0.3.7
 )
+replace github.com/Monibuca/engine/v3 => ../engine
